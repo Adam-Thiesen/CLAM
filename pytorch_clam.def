@@ -1,0 +1,111 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:23.08-py3
+# CUDA 11.8 + PyTorch 2.1 (per your note)
+
+%labels
+    Author "Your Name"
+    Purpose "CLAM-ready PyTorch with OpenSlide, VIPS, Bio-Formats"
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    # We'll drop shims into /usr/local/bin for BF tools; keep bftools dir on PATH too
+    export PATH="/opt/conda/bin:/opt/bftools:/usr/local/bin:$PATH"
+    export TRANSFORMERS_CACHE=/opt/hf-cache
+    export HF_HOME=/opt/hf-cache
+    export HUGGINGFACE_HUB_CACHE=/opt/hf-cache
+    export PYTHONPATH="/opt/CLAM:${PYTHONPATH}"
+    # Bio-Formats Java heap (adjust per cluster policy if needed)
+    export BF_MAX_MEM=32g
+
+%post
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    export PATH="/opt/conda/bin:$PATH"
+
+    # --- Quiet potential pip resolver noise from RAPIDS bits in the base image (not used by CLAM) ---
+    python - <<'PY'
+import subprocess, sys
+for pkg in ("numba","cudf","cugraph","cuml","pylibraft","rmm","dask-cuda","dask-cudf","cupy-cuda12x"):
+    subprocess.call([sys.executable,"-m","pip","uninstall","-y",pkg])
+PY
+
+    # --- System libs: OpenSlide, VIPS, JP2K, Java (headless), libblosc1 for raw2ometiff ---
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        git ca-certificates curl unzip \
+        openslide-tools libopenslide0 \
+        libglib2.0-0 libsm6 libxext6 libxrender1 \
+        libvips-tools libopenjp2-7 default-jre-headless libblosc1
+    rm -rf /var/lib/apt/lists/*
+
+    # HF cache (writable at runtime)
+    mkdir -p /opt/hf-cache && chmod -R 777 /opt/hf-cache
+
+    # --- Python deps for CLAM ---
+    export PIP_ROOT_USER_ACTION=ignore
+    python -m pip install --upgrade pip
+
+    # pin NumPy/SciPy for NGC 23.08
+    pip install --no-cache-dir "numpy==1.26.*" "scipy==1.11.*"
+
+    # Remove any preinstalled OpenCV wheels and stray cv2 folders, then install a safe headless build
+    python - <<'PY'
+import subprocess, sys, shutil, site, glob
+for pkg in ("opencv-python","opencv-contrib-python","opencv-python-headless","opencv"):
+    subprocess.call([sys.executable,"-m","pip","uninstall","-y",pkg])
+for sp in set(site.getsitepackages() + [site.getusersitepackages(), "/usr/local/lib/python3.10/dist-packages","/opt/conda/lib/python3.10/site-packages"]):
+    if not sp:
+        continue
+    for p in glob.glob(sp + "/cv2*"):
+        shutil.rmtree(p, ignore_errors=True)
+PY
+
+    pip install --no-cache-dir --upgrade-strategy only-if-needed \
+        opencv-python-headless==4.7.0.72 \
+        openslide-python timm h5py pandas scikit-learn pyyaml tqdm pillow einops \
+        "transformers==4.41.*" accelerate \
+        git+https://github.com/MahmoodLab/CONCH.git
+
+    # CLAM source (not a pip package)
+    git clone --depth=1 https://github.com/mahmoodlab/CLAM.git /opt/CLAM
+
+    # --- Bio-Formats CLIs ---
+    # 1) bftools (bfconvert, showinf, etc.)
+    BF_VER=6.12.0
+    curl -fsSL -o /tmp/bftools.zip \
+        "https://downloads.openmicroscopy.org/bio-formats/${BF_VER}/artifacts/bftools.zip"
+    mkdir -p /opt/bftools && unzip -q /tmp/bftools.zip -d /opt/bftools
+    chmod -R a+x /opt/bftools
+
+    # 2) bioformats2raw
+    BF2RAW_VER=0.9.4
+    curl -fsSL -L -o /tmp/bioformats2raw.zip \
+        "https://github.com/glencoesoftware/bioformats2raw/releases/download/v${BF2RAW_VER}/bioformats2raw-${BF2RAW_VER}.zip"
+    unzip -q /tmp/bioformats2raw.zip -d /opt
+    ln -sf "/opt/bioformats2raw-${BF2RAW_VER}/bin/bioformats2raw" /usr/local/bin/bioformats2raw
+    chmod +x "/opt/bioformats2raw-${BF2RAW_VER}/bin/"*
+
+    # 3) raw2ometiff
+    RAW2OME_VER=0.7.1
+    curl -fsSL -L -o /tmp/raw2ometiff.zip \
+        "https://github.com/glencoesoftware/raw2ometiff/releases/download/v${RAW2OME_VER}/raw2ometiff-${RAW2OME_VER}.zip"
+    unzip -q /tmp/raw2ometiff.zip -d /opt
+    ln -sf "/opt/raw2ometiff-${RAW2OME_VER}/bin/raw2ometiff" /usr/local/bin/raw2ometiff
+    chmod +x "/opt/raw2ometiff-${RAW2OME_VER}/bin/"*
+
+    # cleanup temp zips
+    rm -f /tmp/bftools.zip /tmp/bioformats2raw.zip /tmp/raw2ometiff.zip
+
+%runscript
+    # default: pass args through (use with: apptainer/singularity exec/run ... <cmd>)
+    exec "$@"
+
+%test
+    # Keep tests simple (avoid heredocs). These should all print versions and True.
+    python -c "import numpy, torch, cv2, openslide; print('numpy', numpy.__version__); print('torch', torch.__version__); print('opencv', cv2.__version__); print('OpenSlide OK', hasattr(openslide,'OpenSlide'))"
+    vips --version
+    bfconvert -version
+    bioformats2raw --version
+    raw2ometiff --version
